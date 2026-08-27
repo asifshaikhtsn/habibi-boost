@@ -4,7 +4,6 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
-from itertools import islice
 
 import aiohttp
 
@@ -14,7 +13,6 @@ DEAD_FILE = DATA_DIR / "dead_proxies.json"
 LIVE_FILE = DATA_DIR / "live_proxies.json"
 COUNTRY_DIR = ROOT / "country"
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 ADDRESS_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})")
 MAX_PROXIES = 50000
 CONCURRENCY = 100
@@ -25,48 +23,31 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 COUNTRY_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_json(path, default):
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
-
-def save_json(path, data):
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
 def load_dead_set():
-    data = load_json(DEAD_FILE, {"dead": []})
-    return set(data.get("dead", []))
+    if DEAD_FILE.exists():
+        try:
+            data = json.loads(DEAD_FILE.read_text(encoding="utf-8"))
+            return set(data.get("dead", []))
+        except Exception:
+            return set()
+    return set()
 
 
 def save_dead_set(dead_set):
-    save_json(DEAD_FILE, {"dead": sorted(dead_set), "updated": time.time()})
-
-
-async def fetch(url, timeout=30):
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s:
-            async with s.get(PROXRIPPER_HTTP, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-    except Exception:
-        pass
-    return ""
+    save_data = {"dead": sorted(dead_set), "updated": time.time(), "count": len(dead_set)}
+    DEAD_FILE.write_text(json.dumps(save_data, indent=2), encoding="utf-8")
 
 
 async def test_proxy(proxy, semaphore):
-    """Test if proxy is alive via HTTP request to httpbin.org/ip"""
+    """Test if proxy is alive via httpbin.org/ip"""
     async with semaphore:
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
                 async with s.get(
                     "http://httpbin.org/ip",
                     proxy=f"http://{proxy}",
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=timeout,
                 ) as resp:
                     if resp.status == 200:
                         return True
@@ -76,211 +57,173 @@ async def test_proxy(proxy, semaphore):
 
 
 async def geolocate_batch(ips):
-    """Get country codes for IPs via ip-api.com"""
+    """Get country codes for IPs via ip-api.com batch API"""
     result = {}
-    batches = [ips[i:i+100] for i in range(0, len(ips), 100)]
+    # dedup and clean ips
+    uniq_ips = list(dict.fromkeys(ips))
+    batches = [uniq_ips[i:i+100] for i in range(0, len(uniq_ips), 100)]
     async with aiohttp.ClientSession() as s:
         for batch in batches:
+            # ip-api expects list of objects or strings? docs: POST /batch with [{"query":"1.1.1.1"}, ...]
+            # but also accepts plain list of strings for backward compat
+            payload = [{"query": ip} for ip in batch]
             for attempt in range(3):
                 try:
                     async with s.post(
                         "http://ip-api.com/batch",
-                        json=batch,
-                        timeout=aiohttp.ClientTimeout(total=30)
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=30),
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             for entry in data:
                                 if isinstance(entry, dict) and entry.get("status") == "success":
-                                    result[entry["query"]] = entry.get("countryCode", "").upper()
+                                    q = entry.get("query", "")
+                                    cc = entry.get("countryCode", "").upper()
+                                    if cc:
+                                        result[q] = cc
                             break
                 except Exception:
                     pass
                 await asyncio.sleep(1)
+            # rate limit safety for ip-api (45 req/min)
+            await asyncio.sleep(0.5)
     return result
 
 
 async def main():
     print("[Boost] Starting ProxRipper HTTP booster...")
-    
+    print(f"[Boost] Config: MAX={MAX_PROXIES}, CONCURRENCY={CONCURRENCY}, TIMEOUT={TIMEOUT}s")
+
     # 1. Load dead set (persistent, never deleted)
-    dead_set = set()
-    if Path("data/dead_proxies.json").exists():
-        data = json.loads(Path("data/dead_proxies.json").read_text())
-        dead_set = set(data.get("dead", []))
+    dead_set = load_dead_set()
     print(f"[Boost] Loaded dead list: {len(dead_set)} proxies")
 
     # 2. Fetch ProxRipper HTTP (first 50k)
     print("[Boost] Fetching ProxRipper HTTP (first 50k)...")
     text = ""
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.get(
-                "https://raw.githubusercontent.com/Mohammedcha/ProxRipper/main/full_proxies/http.txt",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=30)
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as sess:
+            async with sess.get(
+                PROXRIPPER_HTTP,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
                     text = await resp.text()
-        except Exception as e:
-            print(f"Fetch error: {e}")
-            return
+                else:
+                    print(f"[Boost] Fetch failed: HTTP {resp.status}")
+                    return
+    except Exception as e:
+        print(f"[Boost] Fetch error: {e}")
+        return
 
-    # Parse first 50k proxies
+    if not text:
+        print("[Boost] Empty response from ProxRipper")
+        return
+
+    # Parse first 50k proxies - dedup while preserving order
     proxies = []
-    for i, line in enumerate(text.splitlines()):
-        if i >= 50000:
+    seen = set()
+    for line in text.splitlines():
+        if len(proxies) >= MAX_PROXIES:
             break
-        m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}:\d{1,5})", line)
+        m = ADDRESS_RE.search(line)
         if m:
-            proxies.append(m.group(1))
-    
-    print(f"[Boost] Fetched {len(proxies)} proxies from ProxRipper")
+            p = m.group(1)
+            if p not in seen:
+                seen.add(p)
+                proxies.append(p)
 
-    # 3. Filter out already dead proxies
+    print(f"[Boost] Fetched {len(proxies)} unique proxies from ProxRipper (first {MAX_PROXIES})")
+
+    if not proxies:
+        print("[Boost] No proxies found, exiting")
+        return
+
+    # 3. Filter out already dead proxies (dead list is permanent)
     initial_count = len(proxies)
     filtered = [p for p in proxies if p not in dead_set]
-    print(f"  After dead filter: {initial_count} -> {len(proxies)}")
+    removed_dead = initial_count - len(filtered)
+    print(f"[Boost] After dead filter: {initial_count} -> {len(filtered)} (removed {removed_dead} already dead)")
+
+    if not filtered:
+        print("[Boost] All proxies were in dead list, nothing to validate")
+        # still update files to reflect current run
+        save_dead_set(dead_set)
+        return
 
     # 4. Validate proxies (concurrent)
-    print("[Boost] Validating proxies (concurrent, this will take a few minutes)...")
-    semaphore = asyncio.Semaphore(100)
-    
-    async def test_one(proxy):
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-                async with s.get(
-                    "http://httpbin.org/ip",
-                    proxy=f"http://{proxy}",
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status == 200:
-                        return True
-        except Exception:
-            pass
-        return False
-
-    semaphore = asyncio.Semaphore(100)
-    
-    async def test_one(proxy):
-        async with semaphore:
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-                    async with s.get(
-                        "http://httpbin.org/ip",
-                        proxy=f"http://{proxy}",
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        if resp.status == 200:
-                            return True
-        except Exception:
-            pass
-        return False
-
-    # Run validation
-    print(f"[Boost] Validating {len(proxies)} proxies...")
-    tasks = [test_one(p) for p in proxies]
+    print(f"[Boost] Validating {len(filtered)} proxies (concurrency={CONCURRENCY})...")
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    tasks = [test_proxy(p, semaphore) for p in filtered]
     results = await asyncio.gather(*tasks)
-    
-    working = []
-    dead_new = []
-    for proxy, ok in zip(proxies, await asyncio.gather(*[test_one(p) for p in proxies])):
-        if ok:
-            working.append(proxy)
-        else:
-            dead.append(proxy)
 
-    # Actually run validation properly
-    semaphore = asyncio.Semaphore(100)
-    async def test_one(proxy):
-        async with semaphore:
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
-                    async with s.get(
-                        "http://httpbin.org/ip",
-                        proxy=f"http://{proxy}",
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        if resp.status == 200:
-                            return True
-            except Exception:
-                pass
-            return False
+    working = [p for p, ok in zip(filtered, results) if ok]
+    dead_new = [p for p, ok in zip(filtered, results) if not ok]
 
-    print(f"[Boost] Validating {len(proxies)} proxies...")
-    tasks = [test_one(p) for p in proxies]
-    results = await asyncio.gather(*tasks)
-    
-    working = [p for p, ok in zip(proxies, results) if ok]
-    dead_new = [p for p, ok in zip(proxies, results) if not ok]
-    
-    print(f"  Working: {len(working)}, Dead: {len(dead_new)}")
+    print(f"[Boost] Validation done -> Working: {len(working)}, Dead new: {len(dead_new)}")
 
     # 5. Update dead list (persistent, never deleted)
-    dead_set.update(dead_new)
-    Path("data/dead_proxies.json").write_text(json.dumps({"dead": sorted(dead_set), "updated": time.time()}))
-    print(f"  Dead list updated: {len(dead_set)} total")
+    if dead_new:
+        dead_set.update(dead_new)
+    save_dead_set(dead_set)
+    print(f"[Boost] Dead list updated: {len(dead_set)} total (added {len(dead_new)})")
 
     # 6. Geolocate working proxies
-    print(f"[Boost] Geolocating {len(working)} working proxies...")
-    ips = list({p.split(":")[0] for p in working})
-    country_map = {}
-    async with aiohttp.ClientSession() as s:
-        batches = [list(ips)[i:i+100] for i in range(0, len(ips), 100)]
-        for batch in batches:
-            for attempt in range(3):
-                try:
-                    async with aiohttp.ClientSession() as s:
-                        async with s.post(
-                            "http://ip-api.com/batch",
-                            json=batch,
-                            timeout=aiohttp.ClientTimeout(total=30)
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                for entry in data:
-                                    if isinstance(entry, dict) and entry.get("status") == "success":
-                                        country_map[entry["query"]] = entry.get("countryCode", "").upper()
-                                break
-                except Exception:
-                    pass
-                await asyncio.sleep(1)
+    if working:
+        print(f"[Boost] Geolocating {len(working)} working proxies...")
+        ips = [p.split(":")[0] for p in working]
+        country_map = await geolocate_batch(ips)
+        print(f"[Boost] Geolocated {len(country_map)} IPs")
+    else:
+        country_map = {}
+        print("[Boost] No working proxies to geolocate")
 
     # 7. Save live proxies with country
     live_data = []
     for p in working:
         ip = p.split(":")[0]
-        country = country_map.get(ip, "")
+        country = country_map.get(ip, "XX")
         live_data.append({"proxy": p, "country": country})
 
-    Path("data/live_proxies.json").write_text(json.dumps({
-        "proxies": live_data,
-        "updated": time.time()
-    }))
+    LIVE_FILE.write_text(
+        json.dumps({"proxies": live_data, "count": len(live_data), "updated": time.time()}, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[Boost] Saved live list: {LIVE_FILE} ({len(live_data)} proxies)")
 
-    # 7. Sort by country and save
-    country_dir = Path("country")
-    country_dir.mkdir(exist_ok=True)
-    
+    # 8. Sort by country and save per-country files
     by_country = defaultdict(list)
-    for p in working:
-        ip = p.split(":")[0]
-        cc = country_map.get(ip, "XX")
-        by_country[cc].append(p)
+    for entry in live_data:
+        cc = entry.get("country", "XX") or "XX"
+        by_country[cc].append(entry["proxy"])
 
-    for cc, proxies_list in by_country.items():
-        cc_dir = Path("country") / cc
-        cc_dir.mkdir(exist_ok=True)
-        (Path("country") / cc / "http.txt").write_text("\n".join(proxies) + "\n")
+    # Clean old country files and rewrite (keep structure)
+    # Remove stale files
+    if COUNTRY_DIR.exists():
+        for old in COUNTRY_DIR.glob("*"):
+            if old.is_file():
+                old.unlink()
+            elif old.is_dir():
+                for f in old.glob("*"):
+                    if f.is_file():
+                        f.unlink()
 
-    # Save live list
-    json.dump({"proxies": live_data, "updated": time.time()}, open("data/live_proxies.json", "w"), indent=2)
+    for cc, plist in by_country.items():
+        cc_dir = COUNTRY_DIR / cc
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / "http.txt").write_text("\n".join(plist) + "\n", encoding="utf-8")
 
-    print(f"\n[Boost] DONE!")
+    # Also save all working as single file
+    (COUNTRY_DIR / "all_http.txt").write_text("\n".join(working) + "\n" if working else "", encoding="utf-8")
+
+    print("\n[Boost] DONE!")
     print(f"  Working: {len(working)}")
     print(f"  Dead (new): {len(dead_new)}")
     print(f"  Dead list total: {len(dead_set)}")
-    print(f"  Countries: {len(set(c for c in country_map.values() if c))}")
+    print(f"  Countries: {len(by_country)} -> {sorted(by_country.keys())[:10]}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
