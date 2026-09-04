@@ -1,4 +1,4 @@
-name: Shared Proxy Engine CI
+name: Standalone Proxy Engine CI
 
 on:
   push:
@@ -8,11 +8,25 @@ on:
       - ".github/workflows/shared-ci.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    uses: asifshaikhtsn/Walla/.github/workflows/geo-proxy-run.yml@main
-    with:
-      script: ci_target.py
-      dependencies: "aiohttp"
-      commit_message: "Shared engine CI [skip ci]"
-      timeout_minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install aiohttp
+      - name: Fetch proxy v2 engine
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/asifshaikhtsn/Walla/main/geo_country.py -o geo_country.py
+          curl -fsSL https://raw.githubusercontent.com/asifshaikhtsn/Walla/main/geo_runner.py -o geo_runner.py
+      - name: Compile and run engine
+        run: |
+          python -m py_compile geo_country.py geo_runner.py ci_target.py
+          python geo_runner.py ci_target.py
