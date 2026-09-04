@@ -1,0 +1,19 @@
+name: Shared Proxy Engine CI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "ci_target.py"
+      - ".github/workflows/shared-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    uses: asifshaikhtsn/Walla/.github/workflows/geo-proxy-run.yml@main
+    with:
+      script: ci_target.py
+      dependencies: "aiohttp"
+      commit_message: "Shared engine CI [skip ci]"
+      timeout_minutes: 10
+    secrets: inherit
