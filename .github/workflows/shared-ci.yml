@@ -16,4 +16,3 @@ jobs:
       dependencies: "aiohttp"
       commit_message: "Shared engine CI [skip ci]"
       timeout_minutes: 10
-    secrets: inherit
